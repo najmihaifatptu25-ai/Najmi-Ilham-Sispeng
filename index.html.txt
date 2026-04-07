@@ -1,0 +1,215 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <SPI.h>
+#include <SD.h>
+
+// --- KONFIGURASI ---
+const char* ssid = "S1NGKONG";
+const char* password = "HidupMahasiswa368";
+String GOOGLE_URL = "https://script.google.com/macros/s/AKfycbxw195_0q5Mn-b6EGZ2_XpntthcY7yKUVLWrk2NCtMzTd0hguBgSWshiapLx8gAZZer_g/exec";
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define LM35_PIN 34
+#define SD_CS 5
+
+// Objek
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+DHT dht(DHTPIN, DHTTYPE);
+WiFiServer server(80);
+
+// Variabel
+float t_dht, h_dht, t_lm35;
+unsigned long lastCloud = 0;
+const long intervalCloud = 15000;
+
+// --- CSS & HTML Dashboard ---
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>NAJMI SMART LOG</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: white; display: flex; justify-content: center; margin: 0; padding-top: 20px; }
+    .container { width: 90%; max-width: 400px; }
+    .header { text-align: center; margin-bottom: 20px; }
+    .header h2 { color: #38bdf8; letter-spacing: 1px; margin-bottom: 5px; }
+    .header p { color: #64748b; font-size: 0.8rem; }
+    .card { background: rgba(30, 41, 59, 0.7); border: 1px solid #334155; border-radius: 16px; padding: 20px; margin-bottom: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+    .label { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; font-weight: bold; }
+    .value { font-size: 2.2rem; font-weight: 700; margin: 5px 0; color: #f8fafc; }
+    .unit { font-size: 1rem; color: #38bdf8; margin-left: 5px; }
+    .footer { text-align: center; font-size: 0.7rem; color: #475569; margin-top: 20px; }
+    .status-dot { height: 8px; width: 8px; background-color: #22c55e; border-radius: 50%; display: inline-block; margin-right: 5px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2>NAJMI SMART LOG</h2>
+      <p>Real-time IoT Monitoring System</p>
+    </div>
+    <div class="card">
+      <div class="label">Suhu DHT11</div>
+      <div class="value">%TEMP_DHT%<span class="unit">°C</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Kelembaban</div>
+      <div class="value">%HUM%<span class="unit">%</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Suhu LM35</div>
+      <div class="value">%TEMP_LM%<span class="unit">°C</span></div>
+    </div>
+    <div class="footer">
+      <span class="status-dot"></span> System Active | Refresh: 5s
+    </div>
+  </div>
+</body>
+</html>)rawliteral";
+
+String processor(float td, float h, float tl) {
+  String out = String(index_html);
+  out.replace("%TEMP_DHT%", String(td, 1));
+  out.replace("%HUM%", String(h, 0));
+  out.replace("%TEMP_LM%", String(tl, 1));
+  return out;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Inisialisasi OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED Failed");
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println("SYSTEM BOOTING...");
+  display.display();
+
+  // 2. WIFI
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  display.println("Connecting WiFi...");
+  display.display();
+
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+
+  if(WiFi.status() == WL_CONNECTED) {
+    display.println("WiFi: CONNECTED");
+    Serial.print("\nIP Address: ");
+    Serial.println(WiFi.localIP());
+    server.begin(); // Start Web Server
+  } else {
+    display.println("WiFi: TIMEOUT (Offline)");
+  }
+  display.display();
+
+  // 3. SD CARD
+  if(!SD.begin(SD_CS)) {
+    Serial.println("SD Failed");
+    display.println("SD Card: FAILED");
+  } else {
+    Serial.println("SD OK");
+    display.println("SD Card: OK");
+    File file = SD.open("/log_data.csv", FILE_APPEND);
+    if(file && file.size() == 0) {
+      file.println("Waktu_ms,Temp_DHT,Hum_DHT,Temp_LM35");
+      file.close();
+    }
+  }
+  
+  display.display();
+  dht.begin();
+  delay(2000);
+}
+
+void loop() {
+  // --- BACA SENSOR ---
+  t_dht = dht.readTemperature();
+  h_dht = dht.readHumidity();
+
+  // LM35 - Oversampling 20x
+  long rawAnalog = 0;
+  for(int i=0; i<20; i++) { rawAnalog += analogRead(LM35_PIN); delay(2); }
+  float avgAnalog = rawAnalog / 20.0;
+  t_lm35 = (avgAnalog / 4095.0) * 3300.0 / 10.0;
+
+  // --- SAVE SD CARD ---
+  File dataFile = SD.open("/log_data.csv", FILE_APPEND);
+  if (dataFile) {
+    dataFile.printf("%lu,%.2f,%.2f,%.2f\n", millis(), t_dht, h_dht, t_lm35);
+    dataFile.close();
+  }
+
+  // --- UPDATE OLED ---
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("NAJMI SMART LOG");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  display.setCursor(0, 18);
+  display.printf("DHT : %.1f C | %.0f%%", t_dht, h_dht);
+  display.setCursor(0, 32);
+  display.printf("LM35: %.1f C", t_lm35);
+  
+  display.setCursor(0, 54);
+  if (millis() - lastCloud < 3000) {
+    display.print("Cloud: SENDING...");
+  } else {
+    display.print(WiFi.status() == WL_CONNECTED ? "WiFi: ON" : "WiFi: OFF");
+    display.print(" | SD: OK");
+  }
+  display.display();
+
+  // --- SEND TO CLOUD (Setiap 15 Detik) ---
+  if (millis() - lastCloud >= intervalCloud) {
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = GOOGLE_URL + "?dht=" + String(t_dht) + "&ds=0" + "&lm=" + String(t_lm35) + "&rh=" + String(h_dht);
+      http.begin(url.c_str());
+      http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+      int code = http.GET();
+      Serial.printf("Cloud Send, Code: %d\n", code);
+      http.end();
+    }
+    lastCloud = millis();
+  }
+
+  // --- WEB SERVER HANDLER ---
+  WiFiClient client = server.available();
+  if (client) {
+    String currentLine = "";
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        if (c == '\n') {
+          if (currentLine.length() == 0) {
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println("Connection: close");
+            client.println();
+            client.print(processor(t_dht, h_dht, t_lm35));
+            break;
+          } else { currentLine = ""; }
+        } else if (c != '\r') { currentLine += c; }
+      }
+    }
+    client.stop();
+  }
+}
